@@ -18,9 +18,12 @@ from surprisal.surprisal import HuggingFaceSurprisal
 logger = logging.getLogger(name="surprisal")
 
 
+import pandas as pd
+
 ###############################################################################
 ### model classes to compute surprisal
 ###############################################################################
+
 class HuggingFaceModel(Model):
     """
     A class to support language models hosted on the Huggingface Hub
@@ -99,10 +102,31 @@ class CausalHuggingFaceModel(HuggingFaceModel):
         self,
         textbatch: typing.Union[typing.List, str],
         use_bos_token=True,
+        return_prob_dist = False,
+        external_vocab = None
     ) -> typing.List[HuggingFaceSurprisal]:
         import torch
 
-        tokenized = self.tokenize(textbatch)
+        if return_prob_dist:
+            # get the target_word_indices: first appearance of the padding token minus one , otherwise the length of the sentence in tokens minus one
+            test_item_appended = [x + ' dog' for x in textbatch] # append a dummy final word
+            tokenized = self.tokenize(test_item_appended)
+
+            token_indices = [x.cpu().numpy() for x in tokenized['input_ids']]
+
+            def get_index_for_target_word(input_vec):
+                padding_tokens = np.argwhere(input_vec ==  self.tokenizer._convert_token_to_id_with_added_voc(self.tokenizer.pad_token))                
+                if len(padding_tokens) > 0:
+                    return(padding_tokens[0][0] - 1)
+                else:
+                    return(len(input_vec) - 1)
+        
+            target_word_indices = [get_index_for_target_word(x) for x in token_indices]            
+
+        else:
+            tokenized = self.tokenize(textbatch)
+
+
 
         if use_bos_token:
             ids = torch.concat(
@@ -119,6 +143,7 @@ class CausalHuggingFaceModel(HuggingFaceModel):
 
         ids = ids.to(self.device)
 
+        torch.cuda.empty_cache()
         with torch.no_grad():
             output = self.model(
                 ids,
@@ -158,8 +183,89 @@ class CausalHuggingFaceModel(HuggingFaceModel):
                     tokens=tokenized[b], surprisals=-logprobs[b, :].cpu().numpy()
                 )
             ]
-        return accumulator
+        
+        if not return_prob_dist:
+            return accumulator
 
+        else:
+
+            model_internal_vocab = list() 
+            id_to_token = {val: key for key, val in self.tokenizer.vocab.items()}
+            
+            for i in range(self.tokenizer.vocab_size):
+                model_internal_vocab.append(id_to_token[i])
+            model_internal_vocab = model_internal_vocab + ['UNSET', 'UNSET', 'UNSET' ]
+            
+            continuations = []
+            priors = []
+
+            for i in range(len(target_word_indices)):
+                
+                final_word_logits = logits[i, target_word_indices[i]].cpu().numpy()
+                if external_vocab is None:
+                    # return the probabilities of possibilities for the tokenizer associated with the model
+                    final_word_softmax = np.exp(final_word_logits)/np.sum(np.exp(final_word_logits))                
+                    rdf = pd.DataFrame({'word': model_internal_vocab, 'prob':final_word_softmax, 'logit':final_word_logits})
+                    priors.append(final_word_softmax)
+                    continuations.append(rdf.sort_values(by = 'prob', ascending=False))                
+
+                else:
+                    # need to censor this to items that are in the vocabulary
+
+                    final_word_logit_df = pd.DataFrame({'word': model_internal_vocab, 'logit':final_word_logits})
+                    # unique model_internal_vocab is only 30008 long, not 50260. What is going on here. 129 instances of Ġcomp. Check how the vocab was built.
+                    # allegedly self.tokenizer.vocab['Ġcomp'] is just 552
+
+                    # how does this tokenizer work? Are these closest labels in the embedding space 
+                    
+                    external_vocab_df =  pd.DataFrame({'external_lowercase':external_vocab}).merge(final_word_logit_df, how='left', left_on='external_lowercase', right_on='word')
+                    del external_vocab_df['word']
+                    external_vocab_df.columns = ['external_lowercase','lowercase_logit']
+                    
+                    external_vocab_df['external_uppercase'] = [str(x).title() for x in external_vocab_df.external_lowercase]
+                    external_vocab_df =  external_vocab_df.merge(final_word_logit_df, how='left', left_on='external_uppercase', right_on='word')
+                    del external_vocab_df['word']
+                    external_vocab_df.columns = ['external_lowercase','lowercase_logit','external_uppercase', 'uppercase_logit']
+                    
+                    external_vocab_df['external_lowercase_g'] = ['Ġ'+str(x) for x in external_vocab_df.external_lowercase]
+                    external_vocab_df =  external_vocab_df.merge(final_word_logit_df, how='left', left_on='external_lowercase_g', right_on='word')
+                    del external_vocab_df['word']
+                    external_vocab_df.columns = ['external_lowercase','lowercase_logit','external_uppercase', 'uppercase_logit','external_lowercase_g','lowercase_g_logit']
+
+                    external_vocab_df['external_uppercase_g'] = ['Ġ'+str(x) for x in external_vocab_df.external_uppercase]
+                    external_vocab_df =  external_vocab_df.merge(final_word_logit_df, how='left', left_on='external_uppercase_g', right_on='word')
+                    del external_vocab_df['word']
+                    external_vocab_df.columns = ['external_lowercase','lowercase_logit','external_uppercase', 'uppercase_logit','external_lowercase_g','lowercase_g_logit',
+                        'external_uppercase_g','uppercase_g_logit']
+
+
+                    # m x n matrix: m is the form (+Ġ), n is the vocabulary item
+                    # sum these 
+                    # then take the softmax over just those
+                    sum_matrix = np.vstack([external_vocab_df.lowercase_logit, external_vocab_df.uppercase_logit, external_vocab_df.lowercase_g_logit, external_vocab_df.uppercase_g_logit])
+
+                    # subset to column incides where at least one value is not Nan
+                    keeps =  np.argwhere(np.apply_along_axis(lambda x: np.sum(x) > 0, 0, ~np.isnan(sum_matrix))).flatten()
+                    keep_vocab = external_vocab_df.iloc[keeps].external_lowercase.to_list()
+                    keep_logits = sum_matrix[:,keeps]
+                    keep_logits[np.isnan(keep_logits)] = np.NINF
+
+                    # compute the softmax to get probabilities
+                    keeps_softmax = np.exp(keep_logits)/np.sum(np.exp(keep_logits))
+
+                    # sum the probabilities for each vocab item (ie by column)
+                    item_probs = np.apply_along_axis(np.sum, 0, keeps_softmax)
+                    nonzero_prob_vocab_items = pd.DataFrame({'external_lowercase':keep_vocab, 'prob':item_probs})                    
+
+                    # merge this once more against the original vocab
+                    all_external_vocab = external_vocab_df[['external_lowercase']].merge(nonzero_prob_vocab_items, how='left')
+                    all_external_vocab =  all_external_vocab.fillna(0)
+
+                    priors = all_external_vocab.prob                    
+                    continuations = all_external_vocab.sort_values(by = 'prob', ascending=False)
+                    continuations.columns = ['word','prob']
+
+            return priors, continuations
 
 class MaskedHuggingFaceModel(HuggingFaceModel):
     def __init__(self, model_id=None) -> None:
