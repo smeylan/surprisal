@@ -126,8 +126,6 @@ class CausalHuggingFaceModel(HuggingFaceModel):
         else:
             tokenized = self.tokenize(textbatch)
 
-
-
         if use_bos_token:
             ids = torch.concat(
                 (
@@ -189,7 +187,6 @@ class CausalHuggingFaceModel(HuggingFaceModel):
 
         else:
 
-             # need "model_internal_vocab", ordered by index
             id_to_token = {val: key for key, val in  self.tokenizer.get_vocab().items()}
             model_internal_vocab = [id_to_token[i] for i in range(len(id_to_token))]
             
